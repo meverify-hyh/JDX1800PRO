@@ -6,6 +6,7 @@
 # IP 地址：192.168.2.253
 # 网关：192.168.2.254
 # DNS：223.5.5.5 / 119.29.29.29
+# VLAN：233（所有 LAN 口 untagged）
 #===============================================================================
 
 #-------------------------------------------------------------------------------
@@ -19,6 +20,10 @@ LAN_IP="192.168.2.253"
 LAN_NETMASK="255.255.255.0"
 LAN_GATEWAY="192.168.2.254"
 LAN_DNS="223.5.5.5 119.29.29.29"
+
+# VLAN 配置
+VLAN_ID="233"
+VLAN_INTERFACE="br-lan.${VLAN_ID}"
 
 #-------------------------------------------------------------------------------
 # 辅助函数：输出日志
@@ -137,11 +142,11 @@ configure_network_optimization() {
         sed -i '/^net\.core\./d' "$sysctl_conf"
     fi
     
-    # AP 模式专用优化（减少连接追踪开销，提升转发性能）
+    # AP 模式专用优化
     cat >> "$sysctl_conf" << 'EOF'
 
 #========== AP 模式网络优化 ==========#
-# 连接跟踪超时优化（减少内存占用）
+# 连接跟踪超时优化
 net.netfilter.nf_conntrack_tcp_timeout_established = 86400
 net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 30
 net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 30
@@ -149,7 +154,7 @@ net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 10
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
 
-# TCP 性能优化（保持 BBR）
+# TCP 性能优化
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_fin_timeout = 15
@@ -159,7 +164,7 @@ net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_max_tw_buckets = 4096
 
-# TCP 缓冲区（适合 AP 场景）
+# TCP 缓冲区
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 net.core.rmem_default = 131072
@@ -167,7 +172,7 @@ net.core.wmem_default = 131072
 net.core.rmem_max = 8388608
 net.core.wmem_max = 8388608
 
-# 网络队列（减少延迟）
+# 网络队列
 net.core.netdev_max_backlog = 3000
 net.core.somaxconn = 2048
 net.ipv4.ip_local_port_range = 1024 65535
@@ -204,7 +209,7 @@ disable_firewall() {
         log_error "禁用防火墙开机自启失败"
     fi
     
-    # 清空所有防火墙规则（可选）
+    # 清空所有防火墙规则
     if command -v iptables >/dev/null 2>&1; then
         iptables -F 2>/dev/null
         iptables -t nat -F 2>/dev/null
@@ -221,22 +226,68 @@ disable_firewall() {
 }
 
 #-------------------------------------------------------------------------------
-# 配置 AP 模式网络
+# 配置 VLAN 233
+#-------------------------------------------------------------------------------
+configure_vlan() {
+    log_info "正在配置 VLAN $VLAN_ID..."
+    
+    # 1. 启用网桥 VLAN 过滤
+    uci set network.br-lan="device"
+    uci set network.br-lan.name="br-lan"
+    uci set network.br-lan.type="bridge"
+    uci set network.br-lan.vlan_filtering="1"
+    
+    # 2. 添加 LAN 口到网桥
+    uci del_list network.br-lan.ports="lan1" 2>/dev/null
+    uci del_list network.br-lan.ports="lan2" 2>/dev/null
+    uci del_list network.br-lan.ports="lan3" 2>/dev/null
+    uci del_list network.br-lan.ports="lan4" 2>/dev/null
+    uci add_list network.br-lan.ports="lan1"
+    uci add_list network.br-lan.ports="lan2"
+    uci add_list network.br-lan.ports="lan3"
+    uci add_list network.br-lan.ports="lan4"
+    
+    # 3. 删除旧的 VLAN 配置
+    uci delete network.vlan1 2>/dev/null
+    uci delete network.vlan100 2>/dev/null
+    uci delete network.vlan233 2>/dev/null
+    
+    # 4. 定义 VLAN 233（所有端口 untagged）
+    uci set network.vlan233="bridge-vlan"
+    uci set network.vlan233.device="br-lan"
+    uci set network.vlan233.vlan="$VLAN_ID"
+    uci add_list network.vlan233.ports="lan1:u*"
+    uci add_list network.vlan233.ports="lan2:u*"
+    uci add_list network.vlan233.ports="lan3:u*"
+    uci add_list network.vlan233.ports="lan4:u*"
+    
+    # 5. 将 LAN 接口绑定到 VLAN 233 子接口
+    uci set network.lan.device="$VLAN_INTERFACE"
+    
+    # 6. 删除可能残留的其他 VLAN 子接口配置
+    uci delete network.vlan100_iface 2>/dev/null
+    
+    log_info "VLAN $VLAN_ID 配置完成"
+}
+
+#-------------------------------------------------------------------------------
+# 配置 AP 模式网络（固定 IP + 网关 + DNS）
 #-------------------------------------------------------------------------------
 configure_ap_network() {
     log_info "正在配置 AP 模式网络..."
     log_info "LAN IP: $LAN_IP/$LAN_NETMASK"
     log_info "网关: $LAN_GATEWAY"
     log_info "DNS: $LAN_DNS"
+    log_info "VLAN: $VLAN_ID (设备: $VLAN_INTERFACE)"
     
-    # 1. LAN 口配置固定 IP
+    # 1. LAN 口配置固定 IP（已绑定到 VLAN 233 子接口）
     uci set network.lan.proto='static'
     uci set network.lan.ipaddr="$LAN_IP"
     uci set network.lan.netmask="$LAN_NETMASK"
     uci set network.lan.gateway="$LAN_GATEWAY"
     uci set network.lan.dns="$LAN_DNS"
     
-    # 2. 禁用 DHCP 服务（由上级路由器分配 IP）
+    # 2. 禁用 DHCP 服务
     uci set dhcp.lan.ignore='1'
     uci set dhcp.lan.dhcpv4='disabled'
     uci set dhcp.lan.dhcpv6='disabled'
@@ -252,13 +303,13 @@ configure_ap_network() {
     uci commit network
     uci commit dhcp
     
-    # 6. 配置 /etc/resolv.conf（确保 DNS 生效）
+    # 6. 配置 /etc/resolv.conf
     cat > /etc/resolv.conf << EOF
 nameserver 223.5.5.5
 nameserver 119.29.29.29
 EOF
     
-    log_info "AP 网络配置完成"
+    log_info "AP 网络配置完成（VLAN $VLAN_ID）"
 }
 
 #-------------------------------------------------------------------------------
@@ -279,16 +330,20 @@ main() {
     # 4. 禁用防火墙
     disable_firewall
     
-    # 5. 配置 AP 网络（固定 IP + 网关 + DNS）
+    # 5. 配置 VLAN 233
+    configure_vlan
+    
+    # 6. 配置 AP 网络
     configure_ap_network
     
-    # 6. 重启网络服务使配置生效
+    # 7. 重启网络服务使配置生效
     /etc/init.d/network restart
     
     log_info "AP 定制配置应用完成"
     log_info "管理地址: http://$LAN_IP"
     log_info "网关: $LAN_GATEWAY"
     log_info "DNS: $LAN_DNS"
+    log_info "VLAN: $VLAN_ID"
 }
 
 # 执行主函数
